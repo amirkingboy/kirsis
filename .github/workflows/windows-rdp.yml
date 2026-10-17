@@ -1,0 +1,53 @@
+
+name: Windows Runner - Hardware Info
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Show Windows version
+        shell: pwsh
+        run: |
+          Get-ComputerInfo |
+            Select-Object WindowsProductName,
+              WindowsVersion, OsArchitecture
+
+      - name: Show CPU information
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores,
+              NumberOfLogicalProcessors,
+              MaxClockSpeed |
+            Format-List
+
+      - name: Show RAM
+        shell: pwsh
+        run: |
+          $computer = Get-CimInstance Win32_ComputerSystem
+          $ramGB = [math]::Round(
+            $computer.TotalPhysicalMemory / 1GB, 2
+          )
+          Write-Host "Total RAM: $ramGB GB"
+
+      - name: Show disk space
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_LogicalDisk |
+            Where-Object { $_.DriveType -eq 3 } |
+            Select-Object DeviceID,
+              @{N='FreeGB';E={
+                [math]::Round($_.FreeSpace / 1GB, 2)
+              }},
+              @{N='SizeGB';E={
+                [math]::Round($_.Size / 1GB, 2)
+              }} |
+            Format-Table -AutoSize
