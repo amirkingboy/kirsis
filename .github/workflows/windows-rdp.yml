@@ -1,53 +1,216 @@
 
-name: Windows Runner - Hardware Info
+#requires -RunAsAdministrator
+$ErrorActionPreference = 'Stop'
 
-on:
-  workflow_dispatch:
+$HostName = 'minecraft-vps-rdp'
+$RdpUser = 'RDPAdmin'
+$TailscaleExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+$MsiPath = Join-Path $env:TEMP 'tailscale-setup-amd64.msi'
 
-permissions:
-  contents: read
+function Get-CryptoRandomIndex {
+    param(
+        [Parameter(Mandatory)][int]$MaxExclusive,
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.RandomNumberGenerator]$Rng
+    )
 
-jobs:
-  inspect:
-    runs-on: windows-latest
-    timeout-minutes: 10
+    [uint64]$range = 4294967296
+    [uint64]$bound = $range - ($range % [uint64]$MaxExclusive)
 
-    steps:
-      - name: Show Windows version
-        shell: pwsh
-        run: |
-          Get-ComputerInfo |
-            Select-Object WindowsProductName,
-              WindowsVersion, OsArchitecture
+    do {
+        $buffer = New-Object byte[] 4
+        $Rng.GetBytes($buffer)
+        [uint64]$sample = [BitConverter]::ToUInt32($buffer, 0)
+    } while ($sample -ge $bound)
 
-      - name: Show CPU information
-        shell: pwsh
-        run: |
-          Get-CimInstance Win32_Processor |
-            Select-Object Name, NumberOfCores,
-              NumberOfLogicalProcessors,
-              MaxClockSpeed |
-            Format-List
+    return [int]($sample % [uint64]$MaxExclusive)
+}
 
-      - name: Show RAM
-        shell: pwsh
-        run: |
-          $computer = Get-CimInstance Win32_ComputerSystem
-          $ramGB = [math]::Round(
-            $computer.TotalPhysicalMemory / 1GB, 2
-          )
-          Write-Host "Total RAM: $ramGB GB"
+function New-StrongRandomPassword {
+    $sets = @(
+        'ABCDEFGHJKLMNPQRSTUVWXYZ',
+        'abcdefghijkmnopqrstuvwxyz',
+        '23456789',
+        '!@#$%_-+='
+    )
 
-      - name: Show disk space
-        shell: pwsh
-        run: |
-          Get-CimInstance Win32_LogicalDisk |
-            Where-Object { $_.DriveType -eq 3 } |
-            Select-Object DeviceID,
-              @{N='FreeGB';E={
-                [math]::Round($_.FreeSpace / 1GB, 2)
-              }},
-              @{N='SizeGB';E={
-                [math]::Round($_.Size / 1GB, 2)
-              }} |
-            Format-Table -AutoSize
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
+    try {
+        $chars = [System.Collections.Generic.List[char]]::new()
+
+        # Ensure all four character categories are present.
+        foreach ($set in $sets) {
+            $index = Get-CryptoRandomIndex `
+                -MaxExclusive $set.Length -Rng $rng
+            [void]$chars.Add([char]$set[$index])
+        }
+
+        $pool = $sets -join ''
+
+        while ($chars.Count -lt 28) {
+            $index = Get-CryptoRandomIndex `
+                -MaxExclusive $pool.Length -Rng $rng
+            [void]$chars.Add([char]$pool[$index])
+        }
+
+        # Shuffle the password characters.
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = Get-CryptoRandomIndex `
+                -MaxExclusive ($i + 1) -Rng $rng
+
+            $temp = $chars[$i]
+            $chars[$i] = $chars[$j]
+            $chars[$j] = $temp
+        }
+
+        return (-join $chars.ToArray())
+    }
+    finally {
+        $rng.Dispose()
+    }
+}
+
+# 1. Generate a strong password.
+$Password = New-StrongRandomPassword
+$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+
+# 2. Create or update the local administrator account.
+$ExistingUser = Get-LocalUser -Name $RdpUser `
+    -ErrorAction SilentlyContinue
+
+if ($null -eq $ExistingUser) {
+    New-LocalUser -Name $RdpUser `
+        -Password $SecurePassword `
+        -FullName 'RDP Administrator' `
+        -Description 'Administrator for private Tailscale RDP' |
+        Out-Null
+}
+else {
+    Set-LocalUser -Name $RdpUser -Password $SecurePassword
+}
+
+# Get the Administrators group name using its well-known SID.
+$AdminSid = New-Object System.Security.Principal.SecurityIdentifier(
+    'S-1-5-32-544'
+)
+$AdminGroup = $AdminSid.Translate(
+    [System.Security.Principal.NTAccount]
+).Value -split '\\' | Select-Object -Last 1
+
+$Member = Get-LocalGroupMember -Group $AdminGroup |
+    Where-Object { ($_.Name -split '\\')[-1] -ieq $RdpUser }
+
+if (-not $Member) {
+    Add-LocalGroupMember -Group $AdminGroup -Member $RdpUser
+}
+
+# 3. Enable RDP while keeping Network Level Authentication enabled.
+$TSPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+$RdpPath = "$TSPath\WinStations\RDP-Tcp"
+
+Set-ItemProperty -Path $TSPath `
+    -Name 'fDenyTSConnections' -Value 0
+
+Set-ItemProperty -Path $RdpPath `
+    -Name 'UserAuthentication' -Value 1
+
+Set-Service -Name TermService -StartupType Automatic
+Start-Service -Name TermService
+
+# 4. Disable default RDP firewall rules and replace them
+#    with rules restricted to the Tailscale IPv4 range.
+Get-NetFirewallRule -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -match '^RemoteDesktop-UserMode-In-(TCP|UDP)$'
+    } |
+    Disable-NetFirewallRule
+
+Get-NetFirewallRule -DisplayName 'RDP TCP from Tailscale only' `
+    -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule
+
+Get-NetFirewallRule -DisplayName 'RDP UDP from Tailscale only' `
+    -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule
+
+New-NetFirewallRule `
+    -DisplayName 'RDP TCP from Tailscale only' `
+    -Direction Inbound -Action Allow -Protocol TCP `
+    -LocalPort 3389 -RemoteAddress '100.64.0.0/10' `
+    -Profile Any | Out-Null
+
+New-NetFirewallRule `
+    -DisplayName 'RDP UDP from Tailscale only' `
+    -Direction Inbound -Action Allow -Protocol UDP `
+    -LocalPort 3389 -RemoteAddress '100.64.0.0/10' `
+    -Profile Any | Out-Null
+
+# 5. Install Tailscale if it is not already installed.
+if (-not (Test-Path $TailscaleExe)) {
+    Write-Host 'Downloading Tailscale...'
+
+    Invoke-WebRequest `
+        -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+        -OutFile $MsiPath `
+        -UseBasicParsing
+
+    $InstallProcess = Start-Process -FilePath 'msiexec.exe' `
+        -ArgumentList "/i `"$MsiPath`" /qn /norestart" `
+        -Wait -PassThru
+
+    if ($InstallProcess.ExitCode -notin @(0, 3010)) {
+        throw "Tailscale installation failed: $($InstallProcess.ExitCode)"
+    }
+}
+
+if (-not (Test-Path $TailscaleExe)) {
+    throw 'Tailscale executable was not found after installation.'
+}
+
+# 6. Read the authentication key without echoing it.
+Write-Host 'Enter a valid Tailscale auth key when prompted.'
+$SecureKey = Read-Host 'Tailscale auth key' -AsSecureString
+$Pointer = [IntPtr]::Zero
+
+try {
+    $Pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(
+        $SecureKey
+    )
+    $AuthKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+        $Pointer
+    )
+
+    & $TailscaleExe up "--auth-key=$AuthKey" "--hostname=$HostName"
+
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Tailscale could not connect. Check the key and tailnet settings.'
+    }
+}
+finally {
+    if ($Pointer -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Pointer)
+    }
+    if ($SecureKey) {
+        $SecureKey.Dispose()
+    }
+    Remove-Variable AuthKey -ErrorAction SilentlyContinue
+}
+
+# 7. Display connection information.
+Start-Sleep -Seconds 3
+$TailscaleIP = (& $TailscaleExe ip -4 2>$null |
+    Select-Object -First 1)
+
+Write-Host ''
+Write-Host '===== RDP SETUP COMPLETE =====' -ForegroundColor Green
+Write-Host "Tailscale IPv4: $TailscaleIP"
+Write-Host "Username: .\$RdpUser"
+Write-Host "Generated password: $Password"
+Write-Host 'Save the password securely; do not share this console output.'
+Write-Host 'Connect using mstsc.exe to the Tailscale IPv4 above.'
+Write-Host '=============================='
+
+# Reduce the password's lifetime in this PowerShell session.
+Remove-Variable Password -ErrorAction SilentlyContinue
+$SecurePassword.Dispose()
